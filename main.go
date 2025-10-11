@@ -14,7 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const instancesURL = "https://monochrome.prigoana.com/instances.json"
+const instancesURL = "https://github.com/EduardPrigoana/monochrome/raw/refs/heads/main/instances.json"
 
 type Config struct {
 	Port          string
