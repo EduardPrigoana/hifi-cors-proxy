@@ -263,7 +263,7 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			if err := p.cache.Set(cacheKey, body, 24*time.Hour); err != nil {
+			if err := p.cache.Set(cacheKey, body, 2*time.Hour); err != nil {
 				fmt.Printf("Cache set error: %v\n", err)
 			}
 
