@@ -341,7 +341,7 @@ func checkAndSortInstances(instances []string) []string {
 }
 
 func isAllowedPath(path string) bool {
-	if path == "/" {
+	if path == "/" || path == "/health" {
 		return true
 	}
 
@@ -496,31 +496,6 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	if !isAllowedPath(r.URL.Path) {
 		http.Error(w, "Path not allowed", http.StatusForbidden)
-		return
-	}
-
-	if r.URL.Path == "/" {
-		cacheKey := "/"
-		cached, err := p.cache.Get(ctx, cacheKey)
-		if err != nil {
-			logger.Error("cache get error for root path", "error", err)
-		}
-
-		if cached != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Cache", "HIT")
-			w.Write(cached)
-			return
-		}
-
-		responseBody := []byte(`{"status": "ok", "message": "Proxy is running"}`)
-		if err := p.cache.Set(ctx, cacheKey, responseBody, 0); err != nil {
-			logger.Error("cache set error for root path", "error", err)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "MISS")
-		w.Write(responseBody)
 		return
 	}
 
