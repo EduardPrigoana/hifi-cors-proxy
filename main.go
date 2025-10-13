@@ -578,7 +578,7 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		logger.Error("all instances failed", "error", lastErr)
 		http.Error(w, fmt.Sprintf("All instances failed: %v", lastErr), http.StatusBadGateway)
 	} else {
-		logger.Error("no instances available")
+		logger.Error("no instances available?")
 		http.Error(w, "No instances available", http.StatusServiceUnavailable)
 	}
 }
