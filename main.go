@@ -355,6 +355,7 @@ func isAllowedPath(path string) bool {
 		"/playlist/",
 		"/artist/",
 		"/lyrics/",
+		"/home/",
 	}
 
 	for _, prefix := range allowedPrefixes {
