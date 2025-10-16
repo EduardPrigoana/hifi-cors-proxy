@@ -8,27 +8,23 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Send GET request to Frankfurt Deploy Hook
-        run: curl -X GET "$FRANKFURT_DEPLOY_HOOK"
+      - name: Send GET requests to all Deploy Hooks
         env:
           FRANKFURT_DEPLOY_HOOK: ${{ secrets.FRANKFURT_DEPLOY_HOOK }}
-
-      - name: Send GET request to Virginia Deploy Hook
-        run: curl -X GET "$VIRGINIA_DEPLOY_HOOK"
-        env:
           VIRGINIA_DEPLOY_HOOK: ${{ secrets.VIRGINIA_DEPLOY_HOOK }}
-
-      - name: Send GET request to Ohio Deploy Hook
-        run: curl -X GET "$OHIO_DEPLOY_HOOK"
-        env:
           OHIO_DEPLOY_HOOK: ${{ secrets.OHIO_DEPLOY_HOOK }}
-
-      - name: Send GET request to Singapore Deploy Hook
-        run: curl -X GET "$SINGAPORE_DEPLOY_HOOK"
-        env:
           SINGAPORE_DEPLOY_HOOK: ${{ secrets.SINGAPORE_DEPLOY_HOOK }}
-
-      - name: Send GET request to Oregon Deploy Hook
-        run: curl -X GET "$OREGON_DEPLOY_HOOK"
-        env:
           OREGON_DEPLOY_HOOK: ${{ secrets.OREGON_DEPLOY_HOOK }}
+        run: |
+          hooks=(
+            "$FRANKFURT_DEPLOY_HOOK"
+            "$VIRGINIA_DEPLOY_HOOK"
+            "$OHIO_DEPLOY_HOOK"
+            "$SINGAPORE_DEPLOY_HOOK"
+            "$OREGON_DEPLOY_HOOK"
+          )
+
+          for hook in "${hooks[@]}"; do
+            echo "Triggering deploy hook: $hook"
+            curl -fsSL -X GET "$hook" || echo "Failed to trigger $hook"
+          done
