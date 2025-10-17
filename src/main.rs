@@ -1,8 +1,8 @@
 use axum::{
     body::Body,
-    extract::{Request, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    extract::State,
+    http::{HeaderMap, Method, StatusCode, Uri},
+    response::Response,
     routing::any,
     Router,
 };
@@ -89,11 +89,13 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .expect("Failed to bind to port 3000");
+        .expect("Failed to bind");
     
-    info!("Server running on http://0.0.0.0:3000");
+    info!("Server running on http://{}", addr);
     
     axum::serve(listener, app)
         .await
@@ -128,7 +130,7 @@ async fn run_speed_test(state: AppState) {
 
     let mut results: Vec<(String, Duration)> = Vec::new();
     for (i, handle) in handles.into_iter().enumerate() {
-        if let Ok(Ok(Some(duration))) = handle.await {
+        if let Ok(Some(duration)) = handle.await {
             results.push((instances[i].clone(), duration));
         }
     }
@@ -145,15 +147,14 @@ async fn run_speed_test(state: AppState) {
     }
 }
 
-async fn fetch_instances(client: &reqwest::Client) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let response = client.get(INSTANCES_URL).send().await?;
-    let instances: Instances = response.json().await?;
+async fn fetch_instances(client: &reqwest::Client) -> Result<Vec<String>, String> {
+    let response = client.get(INSTANCES_URL).send().await.map_err(|e| e.to_string())?;
+    let instances: Instances = response.json().await.map_err(|e| e.to_string())?;
     Ok(instances.0)
 }
 
-async fn test_instance_speed(client: &reqwest::Client, instance: &str) -> Result<Option<Duration>, Box<dyn std::error::Error>> {
+async fn test_instance_speed(client: &reqwest::Client, instance: &str) -> Option<Duration> {
     let url = format!("{}{}", instance, SPEED_TEST_PATH);
-    
     let start = std::time::Instant::now();
     
     let result = tokio::time::timeout(
@@ -162,11 +163,8 @@ async fn test_instance_speed(client: &reqwest::Client, instance: &str) -> Result
     ).await;
 
     match result {
-        Ok(Ok(response)) if response.status().is_success() => {
-            let duration = start.elapsed();
-            Ok(Some(duration))
-        }
-        _ => Ok(None),
+        Ok(Ok(response)) if response.status().is_success() => Some(start.elapsed()),
+        _ => None,
     }
 }
 
