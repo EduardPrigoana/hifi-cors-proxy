@@ -450,6 +450,56 @@ func shouldRetry(statusCode int, err error) bool {
 	return statusCode >= http.StatusInternalServerError || statusCode == http.StatusTooManyRequests
 }
 
+// isAuthError checks if the response body contains authentication/token errors
+func isAuthError(body []byte) bool {
+	bodyStr := string(body)
+	
+	// Check for common auth error patterns
+	authErrorPatterns := []string{
+		"invalid payload",
+		"Token has invalid payload",
+		"invalid token",
+		"authentication failed",
+		"unauthorized",
+		"token expired",
+		"invalid credentials",
+		"subStatus\":11002",
+		"subStatus\":11001",
+		"subStatus\":11003",
+	}
+	
+	bodyLower := strings.ToLower(bodyStr)
+	for _, pattern := range authErrorPatterns {
+		if strings.Contains(bodyLower, strings.ToLower(pattern)) {
+			return true
+		}
+	}
+	
+	// Also check if it's a JSON response with status 401 and error-like structure
+	var jsonResp map[string]interface{}
+	if err := json.Unmarshal(body, &jsonResp); err == nil {
+		if status, ok := jsonResp["status"].(float64); ok {
+			if int(status) == 401 {
+				return true
+			}
+		}
+		// Check for error messages in common fields
+		for _, field := range []string{"error", "userMessage", "message", "errorMessage"} {
+			if msg, ok := jsonResp[field].(string); ok {
+				msgLower := strings.ToLower(msg)
+				if strings.Contains(msgLower, "token") || 
+				   strings.Contains(msgLower, "auth") || 
+				   strings.Contains(msgLower, "unauthorized") ||
+				   strings.Contains(msgLower, "invalid payload") {
+					return true
+				}
+			}
+		}
+	}
+	
+	return false
+}
+
 func (p *ProxyServer) fetchWithRetry(ctx context.Context, url string) (*http.Response, error) {
 	var lastErr error
 	for i := 0; i < p.config.MaxRetries; i++ {
@@ -540,11 +590,18 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		logger.Error("Cache get error", "error", err, "key", cacheKey, "request_id", reqID)
 	}
 	if cached != nil {
-		logger.Debug("Cache hit", "key", cacheKey, "request_id", reqID)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.Write(cached)
-		return
+		// Check if cached response is an auth error
+		if !isAuthError(cached) {
+			logger.Debug("Cache hit", "key", cacheKey, "request_id", reqID)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", "HIT")
+			w.Write(cached)
+			return
+		} else {
+			// Remove auth error from cache
+			logger.Warn("Cached auth error detected, invalidating cache", "key", cacheKey, "request_id", reqID)
+			// We'll just skip it and fetch from instances
+		}
 	}
 
 	var lastErr error
@@ -576,8 +633,8 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 			logger.Warn("Instance request failed", "instance", instance, "error", err, "request_id", reqID)
 			continue
 		}
+		
 		if resp.StatusCode < http.StatusInternalServerError {
-			p.recordSuccess(instance)
 			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if err != nil {
@@ -586,6 +643,22 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
+			
+			// Check if the response contains auth errors
+			if isAuthError(body) {
+				logger.Warn("Instance returned auth error, skipping to next instance", 
+					"instance", instance, 
+					"status", resp.StatusCode, 
+					"request_id", reqID)
+				p.recordFailure(instance)
+				lastErr = fmt.Errorf("authentication error from instance")
+				continue
+			}
+			
+			// Valid response - record success
+			p.recordSuccess(instance)
+			
+			// Only cache successful responses (2xx status codes)
 			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 				ttl := p.config.CacheTTL
 				if r.URL.Path == "/" {
@@ -595,6 +668,7 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 					logger.Error("Cache set error", "error", err, "key", cacheKey, "request_id", reqID)
 				}
 			}
+			
 			copyResponseHeaders(w.Header(), resp.Header)
 			w.Header().Set("X-Cache", "MISS")
 			w.Header().Set("X-Served-By", instance)
@@ -602,6 +676,7 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Write(body)
 			return
 		}
+		
 		resp.Body.Close()
 		p.recordFailure(instance)
 		lastErr = fmt.Errorf("instance returned status %d", resp.StatusCode)
