@@ -22,10 +22,14 @@ import (
 )
 
 const (
-	instancesURL   = "https://github.com/EduardPrigoana/monochrome/raw/refs/heads/main/instances.json"
-	checkTimeout   = 10 * time.Second
-	maxLatency     = checkTimeout
-	requestIDBytes = 4
+	instancesURL         = "https://github.com/EduardPrigoana/monochrome/raw/refs/heads/main/instances.json"
+	checkTimeout         = 10 * time.Second
+	maxLatency           = checkTimeout
+	requestIDBytes       = 4
+	maxFailures          = 3
+	backoffDuration      = 5 * time.Minute
+	cacheCleanupInterval = 10 * time.Minute
+	initialRetryDelay    = 500 * time.Millisecond
 )
 
 var logger *slog.Logger
@@ -78,6 +82,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxRetries < 1 {
 		return fmt.Errorf("MAX_RETRIES must be at least 1")
+	}
+	if len(c.UserAgents) == 0 {
+		return fmt.Errorf("USER_AGENTS cannot be empty")
 	}
 	return nil
 }
@@ -143,22 +150,34 @@ type InstanceHealth struct {
 	mu          sync.RWMutex
 }
 
+type InstancePerformance struct {
+	URL     string
+	Latency time.Duration
+}
+
+type Cache interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+}
+
 type LocalCache struct {
 	data map[string]cacheEntry
 	mu   sync.RWMutex
 }
+
 type cacheEntry struct {
 	value      []byte
 	expiration time.Time
 }
 
-func NewLocalCache() *LocalCache {
+func NewLocalCache(ctx context.Context) *LocalCache {
 	lc := &LocalCache{
 		data: make(map[string]cacheEntry),
 	}
-	go lc.cleanup()
+	go lc.cleanup(ctx)
 	return lc
 }
+
 func (l *LocalCache) Get(ctx context.Context, key string) ([]byte, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -168,6 +187,7 @@ func (l *LocalCache) Get(ctx context.Context, key string) ([]byte, error) {
 	}
 	return entry.value, nil
 }
+
 func (l *LocalCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -181,18 +201,24 @@ func (l *LocalCache) Set(ctx context.Context, key string, value []byte, ttl time
 	}
 	return nil
 }
-func (l *LocalCache) cleanup() {
-	ticker := time.NewTicker(10 * time.Minute)
+
+func (l *LocalCache) cleanup(ctx context.Context) {
+	ticker := time.NewTicker(cacheCleanupInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		l.mu.Lock()
-		now := time.Now()
-		for key, entry := range l.data {
-			if !entry.expiration.IsZero() && now.After(entry.expiration) {
-				delete(l.data, key)
+	for {
+		select {
+		case <-ticker.C:
+			l.mu.Lock()
+			now := time.Now()
+			for key, entry := range l.data {
+				if !entry.expiration.IsZero() && now.After(entry.expiration) {
+					delete(l.data, key)
+				}
 			}
+			l.mu.Unlock()
+		case <-ctx.Done():
+			return
 		}
-		l.mu.Unlock()
 	}
 }
 
@@ -206,7 +232,7 @@ type ProxyServer struct {
 	config            Config
 }
 
-func newProxyServer(cfg Config, sortedInstances []string) *ProxyServer {
+func newProxyServer(ctx context.Context, cfg Config, sortedInstances []string) *ProxyServer {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -220,7 +246,7 @@ func newProxyServer(cfg Config, sortedInstances []string) *ProxyServer {
 	}
 
 	return &ProxyServer{
-		cache:          NewLocalCache(),
+		cache:          NewLocalCache(ctx),
 		instances:      sortedInstances,
 		instanceHealth: make(map[string]*InstanceHealth),
 		client: &http.Client{
@@ -247,11 +273,12 @@ func (p *ProxyServer) getRandomUserAgent() string {
 }
 
 func loadInstances(ctx context.Context, url string) ([]string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +296,7 @@ func loadInstances(ctx context.Context, url string) ([]string, error) {
 	}
 	return instances, nil
 }
+
 func checkAndSortInstances(ctx context.Context, instances []string, client *http.Client) []string {
 	logger.Info("Checking and sorting instances by performance")
 	var wg sync.WaitGroup
@@ -318,12 +346,13 @@ func checkAndSortInstances(ctx context.Context, instances []string, client *http
 			logAttrs = append(logAttrs, "status", "UNHEALTHY/TIMEOUT")
 			logger.Warn("Instance check result", logAttrs...)
 		} else {
-			logAttrs = append(logAttrs, "latency", perf.Latency.String())
+			logAttrs = append(logAttrs, "latency_ms", perf.Latency.Milliseconds())
 			logger.Info("Instance check result", logAttrs...)
 		}
 	}
 	return sortedInstanceURLs
 }
+
 func isAllowedPath(path string) bool {
 	if path == "/" || path == "/health" {
 		return true
@@ -339,6 +368,7 @@ func isAllowedPath(path string) bool {
 	}
 	return false
 }
+
 func (p *ProxyServer) getInstances() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -346,11 +376,13 @@ func (p *ProxyServer) getInstances() []string {
 	copy(instancesCopy, p.instances)
 	return instancesCopy
 }
+
 func (p *ProxyServer) updateInstances(instances []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.instances = instances
 }
+
 func (p *ProxyServer) startHealthChecker(ctx context.Context) {
 	logger.Info("Starting periodic health checker", "interval", p.config.HealthCheckInterval)
 	ticker := time.NewTicker(p.config.HealthCheckInterval)
@@ -369,6 +401,7 @@ func (p *ProxyServer) startHealthChecker(ctx context.Context) {
 		}
 	}()
 }
+
 func (p *ProxyServer) isHealthy(instance string) bool {
 	p.mu.RLock()
 	health, ok := p.instanceHealth[instance]
@@ -378,10 +411,9 @@ func (p *ProxyServer) isHealthy(instance string) bool {
 	}
 	health.mu.RLock()
 	defer health.mu.RUnlock()
-	const maxFailures = 3
-	const backoffDuration = 5 * time.Minute
 	return health.failures < maxFailures || time.Since(health.lastFailure) > backoffDuration
 }
+
 func (p *ProxyServer) recordFailure(instance string) {
 	p.mu.Lock()
 	if _, ok := p.instanceHealth[instance]; !ok {
@@ -396,6 +428,7 @@ func (p *ProxyServer) recordFailure(instance string) {
 	health.mu.Unlock()
 	logger.Warn("Instance failure recorded", "instance", instance, "failures", failures)
 }
+
 func (p *ProxyServer) recordSuccess(instance string) {
 	p.mu.RLock()
 	health, ok := p.instanceHealth[instance]
@@ -410,6 +443,13 @@ func (p *ProxyServer) recordSuccess(instance string) {
 	}
 }
 
+func shouldRetry(statusCode int, err error) bool {
+	if err != nil {
+		return true
+	}
+	return statusCode >= http.StatusInternalServerError || statusCode == http.StatusTooManyRequests
+}
+
 func (p *ProxyServer) fetchWithRetry(ctx context.Context, url string) (*http.Response, error) {
 	var lastErr error
 	for i := 0; i < p.config.MaxRetries; i++ {
@@ -420,19 +460,32 @@ func (p *ProxyServer) fetchWithRetry(ctx context.Context, url string) (*http.Res
 		req.Header.Set("User-Agent", p.getRandomUserAgent())
 
 		resp, err := p.client.Do(req)
-		if err == nil && resp.StatusCode < http.StatusInternalServerError {
+		if err != nil {
+			lastErr = err
+			if i < p.config.MaxRetries-1 {
+				backoff := time.Duration(1<<uint(i)) * initialRetryDelay
+				reqID, _ := ctx.Value(requestIDKey).(string)
+				logger.Debug("Retrying request after network error", "url", url, "attempt", i+2, "backoff_ms", backoff.Milliseconds(), "request_id", reqID, "error", err)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			continue
+		}
+
+		if !shouldRetry(resp.StatusCode, nil) {
 			return resp, nil
 		}
 
-		lastErr = err
-		if resp != nil {
-			resp.Body.Close()
-		}
+		resp.Body.Close()
+		lastErr = fmt.Errorf("server error: status %d", resp.StatusCode)
 
 		if i < p.config.MaxRetries-1 {
-			backoff := time.Duration(1<<uint(i)) * 500 * time.Millisecond
+			backoff := time.Duration(1<<uint(i)) * initialRetryDelay
 			reqID, _ := ctx.Value(requestIDKey).(string)
-			logger.Debug("Retrying request", "url", url, "attempt", i+2, "backoff", backoff, "request_id", reqID)
+			logger.Debug("Retrying request after server error", "url", url, "status", resp.StatusCode, "attempt", i+2, "backoff_ms", backoff.Milliseconds(), "request_id", reqID)
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
@@ -447,6 +500,22 @@ func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func generateCacheKey(r *http.Request) string {
+	return fmt.Sprintf("%s:%s", r.Method, r.URL.String())
+}
+
+func copyResponseHeaders(dst http.Header, src http.Header) {
+	sensitiveHeaders := map[string]bool{
+		"Set-Cookie":    true,
+		"Authorization": true,
+	}
+	for key, values := range src {
+		if !sensitiveHeaders[key] {
+			dst[key] = values
+		}
+	}
 }
 
 func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -465,13 +534,15 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		return
 	}
-	cacheKey := r.URL.String()
+	cacheKey := generateCacheKey(r)
 	cached, err := p.cache.Get(ctx, cacheKey)
 	if err != nil {
 		logger.Error("Cache get error", "error", err, "key", cacheKey, "request_id", reqID)
 	}
 	if cached != nil {
+		logger.Debug("Cache hit", "key", cacheKey, "request_id", reqID)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
 		w.Write(cached)
 		return
 	}
@@ -493,7 +564,7 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	for i, instance := range allInstances {
 		isFallback := i >= len(healthyInstances)
-		if isFallback && i == len(healthyInstances) { // Log only on the first fallback attempt
+		if isFallback && i == len(healthyInstances) {
 			logger.Warn("All healthy instances failed, falling back to unhealthy ones", "request_id", reqID)
 		}
 
@@ -524,11 +595,9 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 					logger.Error("Cache set error", "error", err, "key", cacheKey, "request_id", reqID)
 				}
 			}
-			for key, values := range resp.Header {
-				for _, value := range values {
-					w.Header().Add(key, value)
-				}
-			}
+			copyResponseHeaders(w.Header(), resp.Header)
+			w.Header().Set("X-Cache", "MISS")
+			w.Header().Set("X-Served-By", instance)
 			w.WriteHeader(resp.StatusCode)
 			w.Write(body)
 			return
@@ -564,6 +633,7 @@ func (p *ProxyServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) 
 	}
 	json.NewEncoder(w).Encode(status)
 }
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := generateRequestID()
@@ -573,17 +643,19 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			"method", r.Method,
 			"path", r.URL.Path,
 			"remote_addr", r.RemoteAddr,
+			"user_agent", r.UserAgent(),
 			"request_id", reqID,
 		)
 		rw := &responseWriter{ResponseWriter: w}
 		next.ServeHTTP(rw, r.WithContext(ctx))
 		logger.Info("Request completed",
 			"status", rw.status,
-			"duration", time.Since(start).String(),
+			"duration_ms", time.Since(start).Milliseconds(),
 			"request_id", reqID,
 		)
 	})
 }
+
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -595,12 +667,14 @@ func (rw *responseWriter) WriteHeader(code int) {
 	}
 	rw.ResponseWriter.WriteHeader(code)
 }
+
 func (rw *responseWriter) Write(b []byte) (int, error) {
 	if rw.status == 0 {
 		rw.status = http.StatusOK
 	}
 	return rw.ResponseWriter.Write(b)
 }
+
 func generateRequestID() string {
 	buf := make([]byte, requestIDBytes)
 	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
@@ -635,7 +709,7 @@ func main() {
 		logger.Error("No instances available after initial health check, cannot start")
 		os.Exit(1)
 	}
-	proxy := newProxyServer(cfg, sortedInstances)
+	proxy := newProxyServer(appCtx, cfg, sortedInstances)
 	proxy.startHealthChecker(appCtx)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", proxy.handleRequest)
