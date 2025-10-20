@@ -57,7 +57,7 @@ func loadConfig() (Config, error) {
 	cfg := Config{
 		Port:                getEnv("PORT", "8080"),
 		LogLevel:            getLogLevelEnv("LOG_LEVEL", slog.LevelInfo),
-		CacheTTL:            getDurationEnv("CACHE_TTL", 2*time.Hour),
+		CacheTTL:            getDurationEnv("CACHE_TTL", 1*time.Hour),
 		HealthCheckInterval: getDurationEnv("HEALTH_CHECK_INTERVAL", 30*time.Minute),
 		RequestTimeout:      getDurationEnv("REQUEST_TIMEOUT", 30*time.Second),
 		MaxRetries:          getIntEnv("MAX_RETRIES", 3),
